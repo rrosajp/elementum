@@ -2244,22 +2244,36 @@ func (s *Service) calcInterfaces() ([]net.IP, []net.IP, error) {
 
 func (s *Service) getNatPort(local net.IP, port int) (int, *natpmp.Client) {
 	gateways := ip.GetPossibleGateways(local)
+	log.Debugf("Testing NAT ports for addr %s and gateways %s", local.String(), gateways)
+	var wg sync.WaitGroup
+	wg.Add(len(gateways))
+
+	var retNat *natpmp.Client
+	var retPort int
+
 	for _, gw := range gateways {
-		nat := natpmp.NewClientWithTimeout(gw, 1500*time.Millisecond)
-		log.Debugf("Testing NAT ports for gateway %s", gw)
+		go func(gw net.IP) {
+			defer wg.Done()
+			nat := natpmp.NewClientWithTimeout(gw, 1500*time.Millisecond)
 
-		tryPort := tryNatPort(nat, port)
-		if tryPort > 0 {
-			return tryPort, nat
-		}
+			tryPort := tryNatPort(nat, port)
+			if tryPort > 0 {
+				retNat = nat
+				retPort = tryPort
+				return
+			}
 
-		tryPort = tryNatPort(nat, 0)
-		if tryPort > 0 {
-			return tryPort, nat
-		}
+			tryPort = tryNatPort(nat, 0)
+			if tryPort > 0 {
+				retNat = nat
+				retPort = tryPort
+				return
+			}
+		}(gw)
 	}
+	wg.Wait()
 
-	return 0, nil
+	return retPort, retNat
 }
 
 // deletePortMappings is deleting all existing port mappings from NAT gateways
@@ -2327,7 +2341,7 @@ func tryNatPort(nat *natpmp.Client, port int) int {
 }
 
 // calcInterfacePorts is searching for a proper port to use for each interface and returns an IP:port list
-func (s *Service) calcInterfacePorts(addrs []net.IP) []string {
+func (s *Service) calcInterfacePorts(queryAddrs []net.IP) []string {
 	// Set port range for automatic port detect
 	if s.config.ListenAutoDetectPort {
 		s.config.ListenPortMin = 6891
@@ -2341,12 +2355,17 @@ func (s *Service) calcInterfacePorts(addrs []net.IP) []string {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
+	// Transform logical addresses into physical addresses
+	addrs := transformInterfaceAddrs(queryAddrs)
+
 	var wg sync.WaitGroup
 	wg.Add(len(addrs))
 
+	var retMu sync.Mutex
 	ret := []string{}
-	for _, addr := range addrs {
-		go func(addr net.IP) {
+
+	for queryAddr, addr := range addrs {
+		go func(queryAddr, addr net.IP) {
 			defer wg.Done()
 
 			// Get random port from a range
@@ -2355,40 +2374,58 @@ func (s *Service) calcInterfacePorts(addrs []net.IP) []string {
 
 			// Use NAT-PMP to get available port to use from gateway
 			if s.config.ListenAutoDetectPort && !s.config.DisableNATPMP {
-				queryAddrs := []net.IP{addr}
-				// Try all local IPs if we don't have a specific interface to be used
-				if addr.String() == "0.0.0.0" {
-					if ips, err := ip.VPNIPs(); err == nil && len(ips) > 0 {
-						queryAddrs = ips
-					}
-				}
-
-				log.Debugf("Testing NAT-PMP ports for %s", queryAddrs)
-
 				// Try to get NAT port for each local IP
-				for _, queryAddr := range queryAddrs {
-					if natPort, natClient := s.getNatPort(queryAddr, port); natPort > 0 {
-						port = natPort
-						mapping.Client = natClient
-						break
+				if natPort, natClient := s.getNatPort(queryAddr, port); natPort > 0 {
+					port = natPort
+					mapping.Client = natClient
+
+					// Store port mapping
+					mapping.Port = port
+					s.mappedPorts.Store(queryAddr.String(), mapping)
+
+					// Construct libtorrent-compatible settings
+					retMu.Lock()
+					if addr.To4() != nil {
+						ret = append(ret, fmt.Sprintf("%s:%d", addr.To4().String(), port))
+					} else {
+						ret = append(ret, fmt.Sprintf("[%s]:%d", addr.To16().String(), port))
 					}
+					if addr.String() != queryAddr.String() {
+						if queryAddr.To4() != nil {
+							ret = append(ret, fmt.Sprintf("%s:%d", queryAddr.To4().String(), port))
+						} else {
+							ret = append(ret, fmt.Sprintf("[%s]:%d", queryAddr.To16().String(), port))
+						}
+					}
+					retMu.Unlock()
 				}
 			}
-
-			// Store port mapping
-			mapping.Port = port
-			s.mappedPorts.Store(addr.String(), mapping)
-
-			// Construct libtorrent-compatible settings
-			if addr.To4() != nil {
-				ret = append(ret, fmt.Sprintf("%s:%d", addr.To4().String(), port))
-			} else {
-				ret = append(ret, fmt.Sprintf("[%s]:%d", addr.To16().String(), port))
-			}
-		}(addr)
+		}(net.IP(queryAddr), addr)
 	}
 
 	wg.Wait()
+
+	return ret
+}
+
+// transformInterfaceAddrs is converting logical addresses into physical ones
+func transformInterfaceAddrs(addrs []net.IP) map[string]net.IP {
+	ret := map[string]net.IP{}
+
+	for _, addr := range addrs {
+		queryAddrs := []net.IP{addr}
+
+		// Try all local IPs if we don't have a specific interface to be used
+		if addr.String() == "0.0.0.0" {
+			if ips, err := ip.VPNIPs(); err == nil && len(ips) > 0 {
+				queryAddrs = ips
+			}
+		}
+
+		for _, queryAddr := range queryAddrs {
+			ret[string(queryAddr.To16())] = addr
+		}
+	}
 
 	return ret
 }
