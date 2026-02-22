@@ -65,8 +65,7 @@ type Service struct {
 
 	listenInterfaces   []net.IP
 	outgoingInterfaces []net.IP
-	portsMu            sync.Mutex
-	mappedPorts        map[string]PortMapping
+	mappedPorts        sync.Map
 
 	InternalProxy *proxy.CustomProxy
 
@@ -107,7 +106,6 @@ func NewService() *Service {
 
 		SpaceChecked: map[string]bool{},
 		Players:      map[string]*Player{},
-		mappedPorts:  map[string]PortMapping{},
 
 		alertsBroadcaster: broadcast.NewBroadcaster(),
 	}
@@ -600,9 +598,8 @@ func (s *Service) stopServices() {
 			s.PackSettings.SetBool("enable_upnp", false)
 		}
 
-		s.portsMu.Lock()
+		// Gracefully clean all the port mappings
 		s.deletePortMappings()
-		s.portsMu.Unlock()
 
 		s.Session.ApplySettings(s.PackSettings)
 	}
@@ -1185,7 +1182,7 @@ func (s *Service) networkRefresh() {
 	defer s.wg.Done()
 
 	netTicker := time.NewTicker(time.Duration(5) * time.Minute)
-	portTicker := time.NewTicker(time.Duration(1) * time.Minute)
+	portTicker := time.NewTicker(time.Duration(45) * time.Second)
 	closing := s.Closer.C()
 	defer func() {
 		netTicker.Stop()
@@ -1218,19 +1215,24 @@ func (s *Service) networkRefresh() {
 			}
 		case <-portTicker.C:
 			needUpdate := false
-			s.portsMu.Lock()
-			for _, mapping := range s.mappedPorts {
-				if mapping.Client == nil {
-					continue
-				}
+			var wg sync.WaitGroup
+			s.mappedPorts.Range(func(key, value any) bool {
+				wg.Add(1)
+				go func(mapping PortMapping) {
+					defer wg.Done()
+					if mapping.Client == nil {
+						return
+					}
 
-				log.Infof("Updating port mapping: %d", mapping.Port)
-				port := tryNatPort(mapping.Client, mapping.Port)
-				if port == 0 || port != mapping.Port {
-					needUpdate = true
-				}
-			}
-			s.portsMu.Unlock()
+					log.Debugf("Updating port mapping: %d", mapping.Port)
+					port := tryNatPort(mapping.Client, mapping.Port)
+					if port == 0 || port != mapping.Port {
+						needUpdate = true
+					}
+				}(value.(PortMapping))
+				return true
+			})
+			wg.Wait()
 
 			if needUpdate {
 				log.Infof("Updating listen interfaces due to port changes in 5s")
@@ -2196,9 +2198,6 @@ func SetWatchedFile(path string, size int64, watched bool) {
 
 // getInterfaceSettings is parsing configuration settings and forming list of IPs with ports for libtorrent
 func (s *Service) getInterfaceSettings() ([]string, []string, error) {
-	s.portsMu.Lock()
-	defer s.portsMu.Unlock()
-
 	// Clear existing mappings
 	s.deletePortMappings()
 
@@ -2263,16 +2262,25 @@ func (s *Service) getNatPort(local net.IP, port int) (int, *natpmp.Client) {
 	return 0, nil
 }
 
+// deletePortMappings is deleting all existing port mappings from NAT gateways
 func (s *Service) deletePortMappings() {
-	for _, mapping := range s.mappedPorts {
-		if mapping.Client == nil {
-			continue
-		}
+	var wg sync.WaitGroup
+	s.mappedPorts.Range(func(key, value interface{}) bool {
+		wg.Add(1)
 
-		log.Infof("Deleting port mapping: %d", mapping.Port)
-		deleteNatPort(mapping.Client, mapping.Port)
-	}
-	s.mappedPorts = map[string]PortMapping{}
+		go func(mapping PortMapping) {
+			defer wg.Done()
+			if mapping.Client == nil {
+				return
+			}
+
+			log.Infof("Deleting port mapping: %d", mapping.Port)
+			deleteNatPort(mapping.Client, mapping.Port)
+		}(value.(PortMapping))
+		return true
+	})
+	wg.Wait()
+	s.mappedPorts = sync.Map{}
 }
 
 func deleteNatPort(nat *natpmp.Client, port int) {
@@ -2333,45 +2341,54 @@ func (s *Service) calcInterfacePorts(addrs []net.IP) []string {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
+	var wg sync.WaitGroup
+	wg.Add(len(addrs))
+
 	ret := []string{}
 	for _, addr := range addrs {
-		// Get random port from a range
-		port := listenPorts[rand.Intn(len(listenPorts))]
-		mapping := PortMapping{}
+		go func(addr net.IP) {
+			defer wg.Done()
 
-		// Use NAT-PMP to get available port to use from gateway
-		if s.config.ListenAutoDetectPort && !s.config.DisableNATPMP {
-			queryAddrs := []net.IP{addr}
-			// Try all local IPs if we don't have a specific interface to be used
-			if addr.String() == "0.0.0.0" {
-				if ips, err := ip.VPNIPs(); err == nil && len(ips) > 0 {
-					queryAddrs = ips
+			// Get random port from a range
+			port := listenPorts[rand.Intn(len(listenPorts))]
+			mapping := PortMapping{}
+
+			// Use NAT-PMP to get available port to use from gateway
+			if s.config.ListenAutoDetectPort && !s.config.DisableNATPMP {
+				queryAddrs := []net.IP{addr}
+				// Try all local IPs if we don't have a specific interface to be used
+				if addr.String() == "0.0.0.0" {
+					if ips, err := ip.VPNIPs(); err == nil && len(ips) > 0 {
+						queryAddrs = ips
+					}
+				}
+
+				log.Debugf("Testing NAT-PMP ports for %s", queryAddrs)
+
+				// Try to get NAT port for each local IP
+				for _, queryAddr := range queryAddrs {
+					if natPort, natClient := s.getNatPort(queryAddr, port); natPort > 0 {
+						port = natPort
+						mapping.Client = natClient
+						break
+					}
 				}
 			}
 
-			log.Debugf("Testing NAT-PMP ports for %s", queryAddrs)
+			// Store port mapping
+			mapping.Port = port
+			s.mappedPorts.Store(addr.String(), mapping)
 
-			// Try to get NAT port for each local IP
-			for _, queryAddr := range queryAddrs {
-				if natPort, natClient := s.getNatPort(queryAddr, port); natPort > 0 {
-					port = natPort
-					mapping.Client = natClient
-					break
-				}
+			// Construct libtorrent-compatible settings
+			if addr.To4() != nil {
+				ret = append(ret, fmt.Sprintf("%s:%d", addr.To4().String(), port))
+			} else {
+				ret = append(ret, fmt.Sprintf("[%s]:%d", addr.To16().String(), port))
 			}
-		}
-
-		// Store port mapping
-		mapping.Port = port
-		s.mappedPorts[addr.String()] = mapping
-
-		// Construct libtorrent-compatible settings
-		if addr.To4() != nil {
-			ret = append(ret, fmt.Sprintf("%s:%d", addr.To4().String(), port))
-		} else {
-			ret = append(ret, fmt.Sprintf("[%s]:%d", addr.To16().String(), port))
-		}
+		}(addr)
 	}
+
+	wg.Wait()
 
 	return ret
 }
