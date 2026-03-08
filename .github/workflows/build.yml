@@ -1,26 +1,27 @@
 name: build
+
 on:
   push:
     branches:
       - '*'
+    tags:
+      - v*
   pull_request:
     branches:
       - '*'
-  create:
-    tags:
-      - v*
 
 jobs:
   build:
     name: Build
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       max-parallel: 5
       matrix:
         platform: [
           android-arm, android-arm64, android-x64, android-x86,
+          darwin-x64,
           linux-armv6, linux-armv7, linux-armv7_softfp, linux-arm64, linux-x64, linux-x86,
-          windows-x64, windows-x86, darwin-x64 ]
+          windows-x64, windows-x86 ]
     steps:
       - name: Checkout
         uses: actions/checkout@v3
