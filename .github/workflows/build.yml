@@ -51,6 +51,7 @@ jobs:
 
       - name: Build ${{ matrix.platform }}
         run: | 
+          env | sort
           make ${{ matrix.platform }} 
           make ${{ matrix.platform }}-shared
 
