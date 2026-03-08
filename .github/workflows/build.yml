@@ -33,8 +33,9 @@ jobs:
 
       - name: Build ${{ matrix.platform }}
         run: | 
-          make ${{ matrix.platform }}
-          make ${{ matrix.platform }}-shared
+          mkdir build
+          make ${{ matrix.platform }} GOPATH="$(readlink -f build)"
+          make ${{ matrix.platform }}-shared GOPATH="$(readlink -f build)"
 
       - name: Generate ${{ matrix.platform }} zip
         id: generate_zip
