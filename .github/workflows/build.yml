@@ -34,25 +34,23 @@ jobs:
       - name: Get Go environment
         id: go-env
         run: |
-          echo "cache=$(go env GOCACHE)" >> $GITHUB_ENV
-          echo "modcache=$(go env GOMODCACHE)" >> $GITHUB_ENV
+          echo "GOCACHE=$(go env GOCACHE)" >> $GITHUB_ENV
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> $GITHUB_ENV
 
       - name: Set up cache
         uses: actions/cache@v3
         with:
           path: |
-            ${{ env.cache }}
-            ${{ env.modcache }}
+            ${{ env.GOCACHE }}
+            ${{ env.GOMODCACHE }}
           key: elementum-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             elementum-${{ runner.os }}-go-
 
       - name: Build ${{ matrix.platform }}
         run: | 
-          mkdir -p ~/.cache/go-build
-          mkdir -p ~/.cache/go-cache
-          make ${{ matrix.platform }} GOPATH="$(readlink -f ~/.cache/go-build)" GOCACHE="$(readlink -f ~/.cache/go-cache)"
-          make ${{ matrix.platform }}-shared GOPATH="$(readlink -f ~/.cache/go-build)" GOCACHE="$(readlink -f ~/.cache/go-cache)"
+          make ${{ matrix.platform }} 
+          make ${{ matrix.platform }}-shared
 
       - name: Generate ${{ matrix.platform }} zip
         id: generate_zip
