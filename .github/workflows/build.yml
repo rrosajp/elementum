@@ -33,9 +33,10 @@ jobs:
 
       - name: Build ${{ matrix.platform }}
         run: | 
-          mkdir build
-          make ${{ matrix.platform }} GOPATH="$(readlink -f build)" GOCACHE="$(readlink -f build/cache)"
-          make ${{ matrix.platform }}-shared GOPATH="$(readlink -f build)" GOCACHE="$(readlink -f build/cache)"
+          mkdir -p ~/.cache/go-build
+          mkdir -p ~/.cache/go-cache
+          make ${{ matrix.platform }} GOPATH="$(readlink -f ~/.cache/go-build)" GOCACHE="$(readlink -f ~/.cache/go-cache)"
+          make ${{ matrix.platform }}-shared GOPATH="$(readlink -f ~/.cache/go-build)" GOCACHE="$(readlink -f ~/.cache/go-cache)"
 
       - name: Generate ${{ matrix.platform }} zip
         id: generate_zip
